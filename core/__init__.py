@@ -61,12 +61,27 @@ except ImportError:
     pass
 
 # ============================================================================
-# TRADING ENGINE (TODO: Implement)
+# TRADING ENGINE
 # ============================================================================
-# try:
-#     from .trading_engine import TradingEngine, EngineStatus
-# except ImportError:
-#     pass
+try:
+    from .trading_engine import (
+        TradingEngine,
+        EngineStatus,
+        TradingMode,
+        PositionSide,
+        OrderStatus,
+        Position,
+        TradingOrder,
+        TradingStats,
+        RiskManager,
+        PositionManager,
+        OrderManager,
+        StrategyManager,
+        create_trading_engine,
+        create_configured_engine
+    )
+except ImportError:
+    pass
 
 # ============================================================================
 # MODULE INFO
@@ -106,13 +121,33 @@ __all__ = [
     "WSMessage", 
     "create_websocket_manager",
     
-    # Trading Engine (TODO)
-    # "TradingEngine",
-    # "EngineStatus",
+    # Trading Engine
+    "TradingEngine",
+    "EngineStatus",
+    "TradingMode", 
+    "PositionSide",
+    "OrderStatus",
+    "Position",
+    "TradingOrder",
+    "TradingStats",
+    "RiskManager",
+    "PositionManager", 
+    "OrderManager",
+    "StrategyManager",
+    "create_trading_engine",
+    "create_configured_engine",
     
     # Core constants
     "CORE_CONSTANTS",
     "get_core_constant",
+    
+    # System management functions
+    "create_core_components",
+    "shutdown_core_components",
+    "start_trading_system",
+    "create_and_start_trading_system",
+    "get_core_status",
+    "get_system_health",
 ]
 
 # ============================================================================
@@ -154,11 +189,24 @@ CORE_CONSTANTS = {
     'BYBIT_RATE_LIMIT_ORDERBOOK': 600,
     'BYBIT_RATE_LIMIT_ACCOUNT': 120,
     
-    # Performance
-    'MAX_CANDLES_PER_REQUEST': 1000,
-    'MAX_QUEUE_SIZE': 1000,
-    'WORKER_POOL_SIZE': 4,
-    'MESSAGE_BATCH_SIZE': 50,
+    # Trading engine settings
+    'TRADING_CYCLE_INTERVAL': 60,        # секунды между циклами
+    'MAX_POSITIONS': 5,                   # максимум открытых позиций
+    'MAX_DAILY_TRADES': 20,               # лимит сделок в день
+    'DEFAULT_POSITION_SIZE_PCT': 0.02,    # размер позиции (2% от баланса)
+    'MIN_CONFIDENCE_THRESHOLD': 0.7,      # минимальная уверенность сигнала
+    
+    # Risk management
+    'MAX_POSITION_SIZE_USD': 1000,        # максимальный размер позиции
+    'MAX_DAILY_LOSS_USD': 100,            # максимальная дневная потеря  
+    'MAX_DRAWDOWN_PCT': 0.1,              # максимальная просадка (10%)
+    'STOP_LOSS_PCT': 0.02,                # стоп-лосс (2%)
+    'TAKE_PROFIT_PCT': 0.04,              # тейк-профит (4%)
+    
+    # Order management
+    'ORDER_EXECUTION_TIMEOUT': 60,        # таймаут исполнения ордера
+    'ORDER_RETRY_ATTEMPTS': 3,            # попытки повтора ордера
+    'ORDER_CLEANUP_HOURS': 24,            # часы до очистки старых ордеров
 }
 
 def get_core_constant(name: str, default=None):
@@ -223,6 +271,25 @@ async def create_core_components(settings=None, database=None):
             if 'data_manager' in components:
                 signal_processor.set_market_data_provider(components['data_manager'])
         
+        # Создаем Trading Engine
+        if 'create_trading_engine' in globals():
+            trading_engine = create_trading_engine(
+                settings=settings,
+                database=database
+            )
+            
+            # Инжектируем зависимости в trading engine
+            if 'bybit_client' in components:
+                trading_engine.set_bybit_client(components['bybit_client'])
+            if 'data_manager' in components:
+                trading_engine.set_data_manager(components['data_manager'])
+            if 'signal_processor' in components:
+                trading_engine.set_signal_processor(components['signal_processor'])
+            if 'websocket_manager' in components:
+                trading_engine.set_websocket_manager(components['websocket_manager'])
+                
+            components['trading_engine'] = trading_engine
+        
         return components
         
     except Exception as e:
@@ -247,6 +314,7 @@ async def shutdown_core_components(components: dict):
         components: Словарь с компонентами от create_core_components
     """
     shutdown_order = [
+        'trading_engine',      # Первым останавливаем координатор
         'signal_processor',
         'data_manager', 
         'websocket_manager',
@@ -270,7 +338,122 @@ async def shutdown_core_components(components: dict):
                 print(f"Error shutting down {component_name}: {e}")
 
 
-def get_core_status(components: dict) -> dict:
+async def start_trading_system(components: dict) -> None:
+    """
+    Запуск всей торговой системы в правильном порядке
+    
+    Args:
+        components: Словарь с компонентами от create_core_components
+    """
+    startup_order = [
+        'bybit_client',
+        'websocket_manager', 
+        'data_manager',
+        'signal_processor',
+        'trading_engine'  # Последним запускаем координатор
+    ]
+    
+    for component_name in startup_order:
+        if component_name in components:
+            component = components[component_name]
+            try:
+                if hasattr(component, 'start'):
+                    await component.start()
+                elif hasattr(component, 'initialize'):
+                    await component.initialize()
+                elif hasattr(component, '__aenter__'):
+                    await component.__aenter__()
+                print(f"✅ {component_name} started")
+            except Exception as e:
+                print(f"❌ Failed to start {component_name}: {e}")
+                # При ошибке останавливаем уже запущенные компоненты
+                await shutdown_core_components(components)
+                raise
+
+
+async def create_and_start_trading_system(settings=None, database=None):
+    """
+    Создание и запуск полной торговой системы одной командой
+    
+    Returns:
+        Словарь с запущенными компонентами
+    """
+    try:
+        # Создаем компоненты
+        components = await create_core_components(settings, database)
+        
+        # Запускаем систему
+        await start_trading_system(components)
+        
+        print("🚀 Trading system started successfully!")
+        return components
+        
+    except Exception as e:
+        print(f"❌ Failed to start trading system: {e}")
+        raise
+
+
+async def get_system_health(components: dict) -> dict:
+    """
+    Получение полного health check всей системы
+    
+    Args:
+        components: Словарь с компонентами
+        
+    Returns:
+        Подробный отчет о здоровье системы
+    """
+    health_report = {
+        'overall_status': 'unknown',
+        'components': {},
+        'trading_engine': {},
+        'system_metrics': {}
+    }
+    
+    try:
+        healthy_components = 0
+        total_components = len(components)
+        
+        # Проверяем каждый компонент
+        for name, component in components.items():
+            try:
+                if hasattr(component, 'health_check'):
+                    component_health = await component.health_check()
+                    health_report['components'][name] = component_health
+                    
+                    # Специальная обработка для trading engine
+                    if name == 'trading_engine':
+                        health_report['trading_engine'] = component_health
+                        # Добавляем торговую статистику
+                        if hasattr(component, 'get_trading_stats'):
+                            health_report['system_metrics'] = component.get_trading_stats()
+                    
+                    if component_health.get('status') in ['healthy', 'running']:
+                        healthy_components += 1
+                else:
+                    health_report['components'][name] = {'status': 'no_health_check'}
+                    healthy_components += 1  # Считаем что OK если нет проверки
+                    
+            except Exception as e:
+                health_report['components'][name] = {'status': 'error', 'error': str(e)}
+        
+        # Определяем общий статус
+        if healthy_components == total_components:
+            health_report['overall_status'] = 'healthy'
+        elif healthy_components > total_components / 2:
+            health_report['overall_status'] = 'degraded'
+        else:
+            health_report['overall_status'] = 'unhealthy'
+            
+        health_report['healthy_components'] = healthy_components
+        health_report['total_components'] = total_components
+        
+        return health_report
+        
+    except Exception as e:
+        health_report['overall_status'] = 'error'
+        health_report['error'] = str(e)
+        return health_report
     """
     Получение статуса всех компонентов ядра
     
@@ -287,6 +470,9 @@ def get_core_status(components: dict) -> dict:
             if hasattr(component, 'health_check'):
                 # Для асинхронных health check нужно вызывать отдельно
                 status[name] = {'has_health_check': True}
+            elif hasattr(component, 'get_trading_stats') and name == 'trading_engine':
+                # Специальная обработка для trading engine
+                status[name] = component.get_trading_stats()
             elif hasattr(component, 'get_stats'):
                 status[name] = component.get_stats()
             elif hasattr(component, 'stats'):
@@ -334,6 +520,17 @@ try:
         
     if 'SignalProcessor' in globals():
         TradingSignalProcessor = SignalProcessor
+        
+    if 'TradingEngine' in globals():
+        Engine = TradingEngine
+        TradingBot = TradingEngine  # Популярный алиас
+        
+    # Алиасы для менеджеров из trading engine
+    if 'PositionManager' in globals():
+        PortfolioManager = PositionManager
+        
+    if 'RiskManager' in globals():
+        RiskController = RiskManager
         
 except:
     pass

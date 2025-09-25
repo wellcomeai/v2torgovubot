@@ -24,7 +24,7 @@ alembic==1.13.2
 # AI & Machine Learning
 openai==1.35.0
 numpy==1.26.4
-pandas==2.2.2
+pandas>=2.2.0
 
 # Telegram Bot
 python-telegram-bot==21.3

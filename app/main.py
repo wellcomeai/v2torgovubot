@@ -1,6 +1,6 @@
 """
 Trading Bot Main Application
-Готов к деплою на Render с полной архитектурой
+Готов к деплою на Render с полной архитектурой и интеграцией всех сервисов
 """
 
 import asyncio
@@ -15,21 +15,26 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
-import sqlite3
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
-# Внутренние импорты (создадим далее)
+# Внутренние импорты
 from app.config.settings import Settings, get_settings
 from core.trading_engine import TradingEngine
 from core.bybit_client import BybitLinearClient
 from core.data_manager import DataManager
-from services.openai_service import OpenAIService
-from services.telegram_service import TelegramService
-from services.backtest_engine import BacktestEngine
-from services.notification_service import NotificationService
+from data.database import Database
+
+# Импорты сервисов - используем удобные функции
+from services import (
+    create_all_services, 
+    shutdown_all_services,
+    check_all_services_health,
+    OpenAIService,
+    TelegramService,
+    NotificationService,
+    BacktestEngine
+)
+
 from strategies.strategy_registry import StrategyRegistry
-from data.database import Database, init_database
 from data.models import Signal, BacktestResult, Base
 from utils.logger import setup_logger
 
@@ -44,11 +49,12 @@ logger = setup_logger(__name__)
 # Глобальные компоненты приложения
 trading_engine: Optional[TradingEngine] = None
 database: Optional[Database] = None
+services: Dict[str, any] = {}
 background_tasks_running = False
 
 
 # ============================================================================
-# PYDANTIC МОДЕЛИ ДЛЯ API
+# PYDANTIC МОДЕЛИ ДЛЯ API (расширены)
 # ============================================================================
 
 class StrategyConfig(BaseModel):
@@ -73,6 +79,7 @@ class SystemStatus(BaseModel):
     active_symbols: List[str]
     websocket_connected: bool
     last_signal_time: Optional[str]
+    services_status: Dict[str, Dict] = {}
 
 class SignalResponse(BaseModel):
     id: int
@@ -83,6 +90,24 @@ class SignalResponse(BaseModel):
     price: float
     timestamp: str
     ai_analysis: Optional[str]
+
+class NotificationRequest(BaseModel):
+    type: str = "custom"
+    title: str = ""
+    message: str
+    priority: str = "normal"
+    channels: List[str] = ["telegram"]
+
+class AIAnalysisRequest(BaseModel):
+    analysis_type: str
+    symbol: str
+    timeframe: str = "5m"
+    additional_context: Dict = {}
+
+class ServiceStats(BaseModel):
+    total_services: int
+    healthy_services: int
+    service_details: Dict[str, Dict]
 
 
 # ============================================================================
@@ -115,7 +140,7 @@ async def startup_sequence():
     """
     Последовательность запуска всех компонентов
     """
-    global trading_engine, database, background_tasks_running
+    global trading_engine, database, background_tasks_running, services
     
     # 1. Инициализация базы данных
     logger.info("📦 Initializing database...")
@@ -127,43 +152,95 @@ async def startup_sequence():
     if not all([settings.BYBIT_API_KEY, settings.BYBIT_API_SECRET]):
         raise ValueError("Bybit API keys not configured")
     
-    # 3. Инициализация торгового движка
+    # 3. Создание всех сервисов
+    logger.info("🔧 Creating services...")
+    services = await create_all_services(
+        settings=settings,
+        database=database
+    )
+    
+    # Логируем какие сервисы созданы
+    available_services = list(services.keys())
+    logger.info(f"✅ Created services: {available_services}")
+    
+    # 4. Инициализация торгового движка
     logger.info("🤖 Initializing Trading Engine...")
     trading_engine = TradingEngine(
         database=database,
         settings=settings
     )
     
-    # 4. Подключение к Bybit
+    # 5. Передача сервисов в trading engine
+    logger.info("🔗 Linking services to Trading Engine...")
+    if hasattr(trading_engine, 'set_services'):
+        trading_engine.set_services(services)
+    else:
+        # Fallback - устанавливаем сервисы по отдельности
+        if 'notifications' in services:
+            trading_engine.notification_service = services['notifications']
+        if 'openai' in services:
+            trading_engine.openai_service = services['openai']
+        if 'telegram' in services:
+            trading_engine.telegram_service = services['telegram']
+        if 'backtest' in services:
+            trading_engine.backtest_engine = services['backtest']
+    
+    # 6. Подключение к Bybit
     logger.info("🔌 Connecting to Bybit...")
     await trading_engine.connect()
     
-    # 5. Загрузка активных стратегий
+    # 7. Загрузка активных стратегий
     logger.info("📊 Loading active strategies...")
     await trading_engine.load_active_strategies()
     
-    # 6. Запуск фоновых задач
+    # 8. Запуск фоновых задач
     logger.info("⚡ Starting background tasks...")
     background_tasks_running = True
     asyncio.create_task(background_market_monitor())
     asyncio.create_task(background_health_monitor())
+    asyncio.create_task(background_service_monitor())
     
-    # 7. Запуск WebSocket соединений
+    # 9. Запуск WebSocket соединений
     logger.info("🌐 Starting WebSocket connections...")
     await trading_engine.start_websockets()
+    
+    # 10. Отправляем уведомление о запуске
+    if 'notifications' in services:
+        await services['notifications'].send_system_status(
+            status="started",
+            components={name: "initialized" for name in services.keys()},
+            metrics={'startup_time': datetime.now().isoformat()}
+        )
 
 
 async def shutdown_sequence():
     """
     Последовательность завершения работы
     """
-    global trading_engine, database, background_tasks_running
+    global trading_engine, database, background_tasks_running, services
     
     background_tasks_running = False
+    
+    # Отправляем уведомление о завершении работы
+    if services.get('notifications'):
+        try:
+            await services['notifications'].send_system_status(
+                status="shutting_down",
+                components={name: "stopping" for name in services.keys()},
+                metrics={'shutdown_time': datetime.now().isoformat()}
+            )
+        except:
+            pass  # Не критично если не отправится
     
     if trading_engine:
         logger.info("🔌 Disconnecting from Bybit...")
         await trading_engine.disconnect()
+    
+    # Закрываем все сервисы
+    if services:
+        logger.info("🔧 Shutting down services...")
+        await shutdown_all_services(services)
+        services.clear()
     
     if database:
         logger.info("📦 Closing database connections...")
@@ -192,7 +269,7 @@ app.add_middleware(
 
 
 # ============================================================================
-# API ENDPOINTS
+# API ENDPOINTS - CORE
 # ============================================================================
 
 @app.get("/", response_model=dict)
@@ -202,6 +279,7 @@ async def root():
         "service": "Advanced Trading Bot",
         "version": "1.0.0",
         "status": "running",
+        "services": list(services.keys()),
         "docs": "/docs"
     }
 
@@ -209,22 +287,126 @@ async def root():
 @app.get("/health", response_model=SystemStatus)
 async def health_check():
     """Проверка состояния системы"""
-    global trading_engine
+    global trading_engine, services
     
     if not trading_engine:
         raise HTTPException(status_code=503, detail="Trading engine not initialized")
     
-    status = await trading_engine.get_system_status()
+    # Получаем статус торгового движка
+    status = await trading_engine.get_system_status() if hasattr(trading_engine, 'get_system_status') else {}
+    
+    # Получаем статус сервисов
+    services_health = await check_all_services_health(services) if services else {'overall_status': 'unknown', 'services': {}}
     
     return SystemStatus(
         status="healthy" if trading_engine.is_running else "unhealthy",
-        uptime=str(datetime.now() - trading_engine.start_time),
-        active_strategies=len(trading_engine.active_strategies),
-        active_symbols=list(trading_engine.active_symbols),
-        websocket_connected=trading_engine.websocket_connected,
-        last_signal_time=status.get("last_signal_time")
+        uptime=str(datetime.now() - trading_engine.start_time) if hasattr(trading_engine, 'start_time') else "unknown",
+        active_strategies=len(getattr(trading_engine, 'active_strategies', [])),
+        active_symbols=list(getattr(trading_engine, 'active_symbols', set())),
+        websocket_connected=getattr(trading_engine, 'websocket_connected', False),
+        last_signal_time=status.get("last_signal_time"),
+        services_status=services_health['services']
     )
 
+
+# ============================================================================
+# API ENDPOINTS - SERVICES
+# ============================================================================
+
+@app.get("/services/status", response_model=ServiceStats)
+async def get_services_status():
+    """Получение статуса всех сервисов"""
+    if not services:
+        raise HTTPException(status_code=503, detail="Services not initialized")
+    
+    health_report = await check_all_services_health(services)
+    
+    return ServiceStats(
+        total_services=health_report['total_services'],
+        healthy_services=health_report['healthy_services'],
+        service_details=health_report['services']
+    )
+
+
+@app.get("/services/{service_name}/stats")
+async def get_service_stats(service_name: str):
+    """Получение статистики конкретного сервиса"""
+    if service_name not in services:
+        raise HTTPException(status_code=404, detail=f"Service '{service_name}' not found")
+    
+    service = services[service_name]
+    if hasattr(service, 'get_stats'):
+        return service.get_stats()
+    else:
+        return {"message": f"Service '{service_name}' does not provide stats"}
+
+
+@app.post("/notifications/send")
+async def send_notification(request: NotificationRequest):
+    """Отправка уведомления"""
+    if 'notifications' not in services:
+        raise HTTPException(status_code=503, detail="Notification service not available")
+    
+    notification_service = services['notifications']
+    
+    success = await notification_service.send_notification({
+        'type': request.type,
+        'title': request.title,
+        'message': request.message,
+        'priority': request.priority,
+        'channels': request.channels,
+        'source': 'api'
+    })
+    
+    return {"success": success, "message": "Notification queued" if success else "Failed to queue notification"}
+
+
+@app.post("/ai/analyze")
+async def ai_analyze(request: AIAnalysisRequest):
+    """Запрос AI анализа"""
+    if 'openai' not in services:
+        raise HTTPException(status_code=503, detail="OpenAI service not available")
+    
+    openai_service = services['openai']
+    
+    try:
+        # Базовый анализ рыночных данных
+        result = await openai_service.analyze_market_data(
+            symbol=request.symbol,
+            timeframe=request.timeframe,
+            market_data=None,  # Можно получить из data_manager
+            analysis_type=request.analysis_type,
+            additional_context=request.additional_context
+        )
+        
+        if result:
+            return result.to_dict()
+        else:
+            raise HTTPException(status_code=400, detail="Analysis failed")
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
+
+
+@app.post("/telegram/test")
+async def test_telegram():
+    """Тестовое сообщение в Telegram"""
+    if 'telegram' not in services:
+        raise HTTPException(status_code=503, detail="Telegram service not available")
+    
+    telegram_service = services['telegram']
+    
+    success = await telegram_service.send_message(
+        "🧪 Test message from Trading Bot API",
+        priority="normal"
+    )
+    
+    return {"success": success, "message": "Test message sent" if success else "Failed to send test message"}
+
+
+# ============================================================================
+# API ENDPOINTS - EXISTING (Updated)
+# ============================================================================
 
 @app.get("/strategies", response_model=List[str])
 async def list_available_strategies():
@@ -248,11 +430,30 @@ async def activate_strategy(config: StrategyConfig):
             timeframe=config.timeframe
         )
         
+        # Отправляем уведомление об активации
+        if 'notifications' in services:
+            await services['notifications'].send_notification({
+                'type': 'system_status',
+                'title': f'Strategy Activated: {config.name}',
+                'message': f'Strategy {config.name} activated for {config.symbol}',
+                'priority': 'normal',
+                'source': 'strategy_management'
+            })
+        
         logger.info(f"✅ Strategy {config.name} activated for {config.symbol}")
         return {"message": f"Strategy {config.name} activated successfully"}
         
     except Exception as e:
         logger.error(f"❌ Failed to activate strategy: {e}")
+        
+        # Отправляем уведомление об ошибке
+        if 'notifications' in services:
+            await services['notifications'].send_error_alert(
+                error_message=str(e),
+                component="strategy_management",
+                severity="medium"
+            )
+        
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -266,6 +467,16 @@ async def deactivate_strategy(strategy_name: str, symbol: str):
     
     try:
         await trading_engine.deactivate_strategy(strategy_name, symbol)
+        
+        # Отправляем уведомление о деактивации
+        if 'notifications' in services:
+            await services['notifications'].send_notification({
+                'type': 'system_status',
+                'title': f'Strategy Deactivated: {strategy_name}',
+                'message': f'Strategy {strategy_name} deactivated for {symbol}',
+                'priority': 'normal',
+                'source': 'strategy_management'
+            })
         
         logger.info(f"⏹️ Strategy {strategy_name} deactivated for {symbol}")
         return {"message": f"Strategy {strategy_name} deactivated successfully"}
@@ -303,14 +514,12 @@ async def get_recent_signals(limit: int = 50):
 @app.post("/backtest")
 async def run_backtest(request: BacktestRequest, background_tasks: BackgroundTasks):
     """Запуск бэктестинга"""
-    global trading_engine
-    
-    if not trading_engine:
-        raise HTTPException(status_code=503, detail="Trading engine not ready")
+    if 'backtest' not in services:
+        raise HTTPException(status_code=503, detail="Backtest service not available")
     
     # Запускаем бэктест в фоне
     background_tasks.add_task(
-        execute_backtest,
+        execute_backtest_with_notifications,
         request.strategy_name,
         request.symbol,
         request.start_date,
@@ -356,7 +565,7 @@ async def send_manual_signal(
 
 
 # ============================================================================
-# ФОНОВЫЕ ЗАДАЧИ
+# ФОНОВЫЕ ЗАДАЧИ (Updated)
 # ============================================================================
 
 async def background_market_monitor():
@@ -374,6 +583,18 @@ async def background_market_monitor():
             
         except Exception as e:
             logger.error(f"❌ Market monitor error: {e}")
+            
+            # Отправляем уведомление об ошибке
+            if services.get('notifications'):
+                try:
+                    await services['notifications'].send_error_alert(
+                        error_message=str(e),
+                        component="market_monitor",
+                        severity="medium"
+                    )
+                except:
+                    pass  # Не блокируем выполнение
+                    
             await asyncio.sleep(5)  # Пауза при ошибке
 
 
@@ -387,14 +608,16 @@ async def background_health_monitor():
         try:
             if trading_engine:
                 # Проверка WebSocket соединений
-                if not trading_engine.websocket_connected:
+                if not getattr(trading_engine, 'websocket_connected', True):
                     logger.warning("⚠️ WebSocket disconnected, attempting reconnection...")
-                    await trading_engine.reconnect_websockets()
+                    if hasattr(trading_engine, 'reconnect_websockets'):
+                        await trading_engine.reconnect_websockets()
                 
                 # Проверка активности стратегий
-                inactive_strategies = await trading_engine.check_strategy_health()
-                if inactive_strategies:
-                    logger.warning(f"⚠️ Inactive strategies detected: {inactive_strategies}")
+                if hasattr(trading_engine, 'check_strategy_health'):
+                    inactive_strategies = await trading_engine.check_strategy_health()
+                    if inactive_strategies:
+                        logger.warning(f"⚠️ Inactive strategies detected: {inactive_strategies}")
             
             await asyncio.sleep(30)  # Проверка каждые 30 секунд
             
@@ -403,7 +626,38 @@ async def background_health_monitor():
             await asyncio.sleep(10)
 
 
-async def execute_backtest(
+async def background_service_monitor():
+    """
+    Фоновый мониторинг сервисов
+    """
+    logger.info("🔧 Starting service monitor...")
+    
+    while background_tasks_running:
+        try:
+            if services:
+                health_report = await check_all_services_health(services)
+                
+                # Проверяем общий статус
+                if health_report['overall_status'] == 'error':
+                    logger.warning(f"⚠️ Services health issues detected: {health_report['services']}")
+                    
+                    # Отправляем критическое уведомление
+                    if services.get('notifications'):
+                        await services['notifications'].send_error_alert(
+                            error_message="Multiple services experiencing issues",
+                            component="service_monitor",
+                            severity="high",
+                            additional_info={'health_report': health_report}
+                        )
+            
+            await asyncio.sleep(60)  # Проверка каждую минуту
+            
+        except Exception as e:
+            logger.error(f"❌ Service monitor error: {e}")
+            await asyncio.sleep(30)
+
+
+async def execute_backtest_with_notifications(
     strategy_name: str,
     symbol: str,
     start_date: str,
@@ -412,32 +666,65 @@ async def execute_backtest(
     initial_balance: float
 ):
     """
-    Выполнение бэктестинга в фоне
+    Выполнение бэктестинга в фоне с уведомлениями
     """
     try:
         logger.info(f"🧪 Starting backtest: {strategy_name} on {symbol}")
         
-        backtest_engine = BacktestEngine(database)
+        if 'backtest' not in services:
+            raise Exception("Backtest service not available")
+        
+        # Отправляем уведомление о начале
+        if services.get('notifications'):
+            await services['notifications'].send_notification({
+                'type': 'system_status',
+                'title': 'Backtest Started',
+                'message': f'Started backtest of {strategy_name} on {symbol}',
+                'priority': 'low',
+                'source': 'backtest_engine'
+            })
+        
+        backtest_engine = services['backtest']
         results = await backtest_engine.run_backtest(
             strategy_name=strategy_name,
             symbol=symbol,
             start_date=start_date,
             end_date=end_date,
-            params=params,
+            strategy_params=params,
             initial_balance=initial_balance
         )
         
         # Сохраняем результаты
-        await database.save_backtest_result(results)
+        if database:
+            await database.save_backtest_result(results)
+        
+        # Отправляем уведомление о завершении
+        if services.get('notifications'):
+            await services['notifications'].send_notification({
+                'type': 'custom',
+                'title': 'Backtest Completed',
+                'message': f'Backtest of {strategy_name} completed\nReturn: {results.get("total_return", 0):.2%}\nTrades: {results.get("total_trades", 0)}',
+                'priority': 'normal',
+                'source': 'backtest_engine'
+            })
         
         logger.info(f"✅ Backtest completed: {strategy_name}")
         
     except Exception as e:
         logger.error(f"❌ Backtest failed: {e}")
+        
+        # Отправляем уведомление об ошибке
+        if services.get('notifications'):
+            await services['notifications'].send_error_alert(
+                error_message=str(e),
+                component="backtest_engine",
+                severity="medium",
+                additional_info={'strategy': strategy_name, 'symbol': symbol}
+            )
 
 
 # ============================================================================
-# GRACEFUL SHUTDOWN
+# GRACEFUL SHUTDOWN (Unchanged)
 # ============================================================================
 
 def signal_handler(sig, frame):
@@ -454,7 +741,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 
 # ============================================================================
-# MAIN ENTRY POINT
+# MAIN ENTRY POINT (Unchanged)
 # ============================================================================
 
 if __name__ == "__main__":
